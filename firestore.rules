@@ -13,7 +13,7 @@ service cloud.firestore {
     match /users/{uid} {
       allow read: if signedIn();
       allow create, update: if self(uid)
-        && request.resource.data.keys().hasOnly(['displayName', 'photoUrl', 'bio', 'hobbies'])
+        && request.resource.data.keys().hasOnly(['displayName', 'fullName', 'photoUrl', 'bio', 'hobbies', 'preferredCityId', 'preferredCityName'])
         && request.resource.data.get('bio', '') is string
         && request.resource.data.get('bio', '').size() <= 2000;
       allow delete: if self(uid);
