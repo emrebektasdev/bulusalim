@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:bulusalim_app_01/core/firebase/firestore_dates.dart';
 
 import 'package:bulusalim_app_01/core/firebase/firebase_paths.dart';
 import 'package:bulusalim_app_01/features/event/data/models/event.dart';
@@ -9,34 +10,38 @@ class EventRepositoryImpl implements EventRepository {
   final FirebaseFirestore _firestore;
 
   EventRepositoryImpl({FirebaseFirestore? firestore})
-      : _firestore = firestore ?? FirebaseFirestore.instance;
+    : _firestore = firestore ?? FirebaseFirestore.instance;
 
-  CollectionReference<Event> get _eventsRef =>
-      _firestore.collection(FirestorePaths.events).withConverter<Event>(
-            fromFirestore: (snapshot, _) => Event.fromJson(
-              {'id': snapshot.id, ...?snapshot.data()},
-            ),
-            toFirestore: (event, _) {
-              final json = event.toJson();
-              json.remove('id'); // ID is the document key
-              if (json['createdAt'] == null) {
-                json['createdAt'] = FieldValue.serverTimestamp();
-              }
-              return json;
-            },
-          );
+  CollectionReference<Event> get _eventsRef => _firestore
+      .collection(FirestorePaths.events)
+      .withConverter<Event>(
+        fromFirestore: (snapshot, _) => Event.fromJson({
+          'id': snapshot.id,
+          ...decodeFirestoreDates(snapshot.data() ?? {}),
+        }),
+        toFirestore: (event, _) {
+          final json = event.toJson();
+          json.remove('id'); // ID is the document key
+          if (json['createdAt'] == null) {
+            json['createdAt'] = FieldValue.serverTimestamp();
+          }
+          return encodeFirestoreDates(json);
+        },
+      );
 
-  CollectionReference<EventAttendee> _attendeesRef(String eventId) =>
-      _firestore.collection(FirestorePaths.eventAttendees(eventId)).withConverter<EventAttendee>(
-            fromFirestore: (snapshot, _) => EventAttendee.fromJson(snapshot.data()!),
-            toFirestore: (attendee, _) {
-              final json = attendee.toJson();
-              if (json['joinedAt'] == null) {
-                json['joinedAt'] = FieldValue.serverTimestamp();
-              }
-              return json;
-            },
-          );
+  CollectionReference<EventAttendee> _attendeesRef(String eventId) => _firestore
+      .collection(FirestorePaths.eventAttendees(eventId))
+      .withConverter<EventAttendee>(
+        fromFirestore: (snapshot, _) =>
+            EventAttendee.fromJson(decodeFirestoreDates(snapshot.data()!)),
+        toFirestore: (attendee, _) {
+          final json = attendee.toJson();
+          if (json['joinedAt'] == null) {
+            json['joinedAt'] = FieldValue.serverTimestamp();
+          }
+          return encodeFirestoreDates(json);
+        },
+      );
 
   @override
   Future<Event> createEvent({
@@ -71,10 +76,7 @@ class EventRepositoryImpl implements EventRepository {
       attendeeCount: 1, // Organizer automatically 'going'
     );
 
-    final attendee = EventAttendee(
-      uid: organizerId,
-      status: RsvpStatus.going,
-    );
+    final attendee = EventAttendee(uid: organizerId, status: RsvpStatus.going);
 
     final batch = _firestore.batch();
     batch.set(newDoc, event);
@@ -91,11 +93,15 @@ class EventRepositoryImpl implements EventRepository {
   }) async {
     var query = _eventsRef
         .where('isDeleted', isEqualTo: false)
-        .where('startDate', isGreaterThanOrEqualTo: DateTime.now()) // Only upcoming
+        .where(
+          'startDate',
+          isGreaterThanOrEqualTo: DateTime.now(),
+        ) // Only upcoming
         .orderBy('startDate', descending: false)
         .limit(limit);
 
-    if (startAfterDocumentSnapshot != null && startAfterDocumentSnapshot is DocumentSnapshot) {
+    if (startAfterDocumentSnapshot != null &&
+        startAfterDocumentSnapshot is DocumentSnapshot) {
       query = query.startAfterDocument(startAfterDocumentSnapshot);
     }
 
@@ -112,10 +118,14 @@ class EventRepositoryImpl implements EventRepository {
     var query = _eventsRef
         .where('communityId', isEqualTo: communityId)
         .where('isDeleted', isEqualTo: false)
-        .orderBy('createdAt', descending: true) // For community, maybe show all including past
+        .orderBy(
+          'createdAt',
+          descending: true,
+        ) // For community, maybe show all including past
         .limit(limit);
 
-    if (startAfterDocumentSnapshot != null && startAfterDocumentSnapshot is DocumentSnapshot) {
+    if (startAfterDocumentSnapshot != null &&
+        startAfterDocumentSnapshot is DocumentSnapshot) {
       query = query.startAfterDocument(startAfterDocumentSnapshot);
     }
 
@@ -134,9 +144,7 @@ class EventRepositoryImpl implements EventRepository {
 
   @override
   Future<void> updateCoverImage(String eventId, String url) async {
-    await _eventsRef.doc(eventId).update({
-      'coverImageUrl': url,
-    });
+    await _eventsRef.doc(eventId).update({'coverImageUrl': url});
   }
 
   @override
@@ -156,28 +164,30 @@ class EventRepositoryImpl implements EventRepository {
       final currentEventData = eventDoc.data()!;
 
       final attendeeDoc = await transaction.get(attendeeDocRef);
-      final currentStatus = attendeeDoc.exists ? attendeeDoc.data()!.status : null;
+      final currentStatus = attendeeDoc.exists
+          ? attendeeDoc.data()!.status
+          : null;
 
       // Determine changes to attendee count
       int countChange = 0;
       if (newStatus == RsvpStatus.going && currentStatus != RsvpStatus.going) {
         countChange = 1;
-      } else if (newStatus != RsvpStatus.going && currentStatus == RsvpStatus.going) {
+      } else if (newStatus != RsvpStatus.going &&
+          currentStatus == RsvpStatus.going) {
         countChange = -1;
       }
 
       // Check capacity
       if (countChange > 0 && currentEventData.capacity != null) {
         if (currentEventData.attendeeCount >= currentEventData.capacity!) {
-          throw Exception('Kapasite dolu, artık "Gidiyorum" olarak işaretleyemezsiniz.');
+          throw Exception(
+            'Kapasite dolu, artık "Gidiyorum" olarak işaretleyemezsiniz.',
+          );
         }
       }
 
       // Write changes
-      final newAttendee = EventAttendee(
-        uid: uid,
-        status: newStatus,
-      );
+      final newAttendee = EventAttendee(uid: uid, status: newStatus);
       transaction.set(attendeeDocRef, newAttendee);
 
       if (countChange != 0) {
