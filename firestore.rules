@@ -1,44 +1,158 @@
 rules_version = '2';
-
 service cloud.firestore {
   match /databases/{database}/documents {
-    
-    // Sadece kimliği doğrulanmış kullanıcılar
-    function isAuthenticated() {
-      return request.auth != null;
+    function signedIn() { return request.auth != null; }
+    function self(uid) { return signedIn() && request.auth.uid == uid; }
+    function communityOwner(id) { return signedIn() && get(/databases/$(database)/documents/communities/$(id)).data.ownerId == request.auth.uid; }
+    function eventOwner(id) { return signedIn() && get(/databases/$(database)/documents/events/$(id)).data.organizerId == request.auth.uid; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // Profile collection-group queries need these reads; never grant writes here.
+    match /{path=**}/members/{uid} { allow read: if signedIn(); }
+    match /{path=**}/attendees/{uid} { allow read: if signedIn(); }
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create, update: if self(uid)
+        && request.resource.data.keys().hasOnly(['displayName', 'photoUrl', 'bio', 'hobbies'])
+        && request.resource.data.get('bio', '') is string
+        && request.resource.data.get('bio', '').size() <= 2000;
+      allow delete: if self(uid);
+      match /blockedUsers/{blockedUid} { allow read, write: if self(uid); }
     }
-
-    match /users/{userId} {
-      allow read: if isAuthenticated();
-      allow write: if request.auth.uid == userId;
-    }
-
-    match /communities/{communityId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
-      allow update: if isAuthenticated(); 
-      allow delete: if isAuthenticated() && request.auth.uid == resource.data.ownerId;
-
-      match /members/{userId} {
-        allow read: if isAuthenticated();
-        allow write: if isAuthenticated() && request.auth.uid == userId; 
+    match /communities/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.memberCount == 1 && request.resource.data.isDeleted == false
+        && request.resource.data.isPrivate is bool && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/communities/$(id)/members/$(request.auth.uid)).data.role == 'owner';
+      allow update: if signedIn() && (
+        (communityOwner(id) && changedOnly(['name', 'description', 'category', 'isPrivate', 'isDeleted',
+          'coverImageUrl', 'cityId', 'cityName', 'scope']))
+        || memberCountChange());
+      allow delete: if false; // Use owner-authorized soft deletion.
+      function memberCountChange() {
+        let before = exists(/databases/$(database)/documents/communities/$(id)/members/$(request.auth.uid));
+        let after = existsAfter(/databases/$(database)/documents/communities/$(id)/members/$(request.auth.uid));
+        let delta = (after ? 1 : 0) - (before ? 1 : 0);
+        return changedOnly(['memberCount']) && request.resource.data.memberCount is int
+          && request.resource.data.memberCount >= 1
+          && ((delta != 0 && request.resource.data.memberCount == resource.data.memberCount + delta)
+            || (communityOwner(id) && (request.resource.data.memberCount == resource.data.memberCount + 1
+              || request.resource.data.memberCount == resource.data.memberCount - 1)));
       }
-      
-      match /joinRequests/{userId} {
-        allow read: if isAuthenticated();
-        allow write: if isAuthenticated() && request.auth.uid == userId;
+      match /members/{uid} {
+        allow read: if signedIn();
+        allow create: if signedIn() && request.resource.data.keys().hasOnly(['uid', 'role', 'joinedAt'])
+          && request.resource.data.uid == uid && request.resource.data.joinedAt == request.time
+          && (
+            (self(uid) && !exists(/databases/$(database)/documents/communities/$(id))
+              && getAfter(/databases/$(database)/documents/communities/$(id)).data.ownerId == uid
+              && request.resource.data.role == 'owner')
+            || (request.resource.data.role == 'member'
+              && get(/databases/$(database)/documents/communities/$(id)).data.isDeleted == false
+              && (communityOwner(id) || (self(uid)
+                && (get(/databases/$(database)/documents/communities/$(id)).data.isPrivate == false
+                  || get(/databases/$(database)/documents/communities/$(id)/joinRequests/$(uid)).data.status == 'approved')))
+              && getAfter(/databases/$(database)/documents/communities/$(id)).data.memberCount
+                == get(/databases/$(database)/documents/communities/$(id)).data.memberCount + 1));
+        allow update: if communityOwner(id) && resource.data.role != 'owner'
+          && changedOnly(['role']) && request.resource.data.role in ['member', 'moderator'];
+        allow delete: if signedIn() && (self(uid) || communityOwner(id)) && resource.data.role != 'owner'
+          && getAfter(/databases/$(database)/documents/communities/$(id)).data.memberCount
+            == get(/databases/$(database)/documents/communities/$(id)).data.memberCount - 1;
+      }
+      match /joinRequests/{uid} {
+        allow read: if self(uid) || communityOwner(id);
+        allow create: if self(uid) && request.resource.data.keys().hasOnly(['uid', 'status', 'requestedAt'])
+          && request.resource.data.uid == uid && request.resource.data.status == 'pending'
+          && request.resource.data.requestedAt == request.time
+          && get(/databases/$(database)/documents/communities/$(id)).data.isDeleted == false;
+        allow update: if communityOwner(id) && resource.data.status == 'pending'
+          && changedOnly(['status', 'reviewedAt']) && request.resource.data.status in ['approved', 'rejected'];
+        allow delete: if self(uid) || communityOwner(id);
       }
     }
-
-    match /events/{eventId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
-      allow update: if isAuthenticated();
-      allow delete: if isAuthenticated() && request.auth.uid == resource.data.organizerId;
-
-      match /attendees/{userId} {
-        allow read: if isAuthenticated();
-        allow write: if isAuthenticated() && request.auth.uid == userId;
+    match /events/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.organizerId == request.auth.uid
+        && request.resource.data.attendeeCount == 1 && request.resource.data.isDeleted == false
+        && request.resource.data.createdAt == request.time
+        && capacityValid(request.resource.data)
+        && (request.resource.data.get('communityId', null) == null
+          || communityOwner(request.resource.data.communityId))
+        && getAfter(/databases/$(database)/documents/events/$(id)/attendees/$(request.auth.uid)).data.status == 'going';
+      allow update: if signedIn() && capacityValid(request.resource.data) && (
+        (eventOwner(id) && changedOnly(['title', 'description', 'coverImageUrl', 'location', 'address',
+          'startDate', 'endDate', 'capacity', 'isOnline', 'tags', 'isDeleted', 'district', 'cityName',
+          'category', 'joinType', 'visibilityScope', 'cityId', 'geohash']))
+        || attendeeCountChange());
+      allow delete: if false;
+      function capacityValid(d) {
+        return d.attendeeCount is int && d.attendeeCount >= 0
+          && (d.get('capacity', null) == null || (d.capacity is int && d.capacity >= d.attendeeCount && d.capacity >= 1));
+      }
+      function going(uid, after) {
+        let path = /databases/$(database)/documents/events/$(id)/attendees/$(uid);
+        return after ? (existsAfter(path) && getAfter(path).data.status == 'going')
+          : (exists(path) && get(path).data.status == 'going');
+      }
+      function attendeeCountChange() {
+        let delta = (going(request.auth.uid, true) ? 1 : 0) - (going(request.auth.uid, false) ? 1 : 0);
+        return changedOnly(['attendeeCount'])
+          && ((delta != 0 && request.resource.data.attendeeCount == resource.data.attendeeCount + delta)
+            || (eventOwner(id) && (request.resource.data.attendeeCount == resource.data.attendeeCount + 1
+              || request.resource.data.attendeeCount == resource.data.attendeeCount - 1)));
+      }
+      match /attendees/{uid} {
+        allow read: if signedIn();
+        allow create, update: if signedIn() && (self(uid) || eventOwner(id))
+          && request.resource.data.keys().hasOnly(['uid', 'status', 'joinedAt', 'role'])
+          && request.resource.data.uid == uid
+          && request.resource.data.status in ['going', 'interested', 'not_going']
+          && request.resource.data.get('role', 'participant') ==
+            (getAfter(/databases/$(database)/documents/events/$(id)).data.organizerId == uid
+              ? request.resource.data.get('role', 'participant') : 'participant')
+          && request.resource.data.get('role', 'participant') in ['participant', 'organizer']
+          && getAfter(/databases/$(database)/documents/events/$(id)).data.isDeleted == false
+          && allowedToAttend()
+          && correctCount();
+        allow delete: if signedIn() && (self(uid) || eventOwner(id))
+          && getAfter(/databases/$(database)/documents/events/$(id)).data.attendeeCount ==
+            get(/databases/$(database)/documents/events/$(id)).data.attendeeCount - (resource.data.status == 'going' ? 1 : 0);
+        function allowedToAttend() {
+          let event = getAfter(/databases/$(database)/documents/events/$(id)).data;
+          return request.resource.data.status != 'going' || event.organizerId == request.auth.uid
+            || ((event.get('joinType', 'direct') == 'direct'
+                || getAfter(/databases/$(database)/documents/events/$(id)/joinRequests/$(uid)).data.status == 'approved')
+              && (event.get('communityId', null) == null
+                || get(/databases/$(database)/documents/communities/$(event.communityId)).data.isPrivate == false
+                || exists(/databases/$(database)/documents/communities/$(event.communityId)/members/$(uid))));
+        }
+        function correctCount() {
+          let parent = /databases/$(database)/documents/events/$(id);
+          let delta = (request.resource.data.status == 'going' ? 1 : 0) - (going(uid, false) ? 1 : 0);
+          return (!exists(parent) && self(uid) && getAfter(parent).data.organizerId == uid)
+            || getAfter(parent).data.attendeeCount == get(parent).data.attendeeCount + delta;
+        }
+      }
+      match /joinRequests/{uid} {
+        allow read: if self(uid) || eventOwner(id);
+        allow create: if self(uid) && request.resource.data.uid == uid
+          && request.resource.data.keys().hasOnly(['uid', 'status', 'requestedAt'])
+          && request.resource.data.status == 'pending' && request.resource.data.requestedAt == request.time;
+        allow update: if eventOwner(id) && resource.data.status == 'pending'
+          && changedOnly(['status', 'reviewedAt']) && request.resource.data.status in ['approved', 'rejected'];
+        allow delete: if self(uid) || eventOwner(id);
+      }
+      match /chatMessages/{messageId} {
+        function participant() { return signedIn() && (eventOwner(id) || going(request.auth.uid, false)); }
+        allow read: if participant();
+        allow create: if participant() && request.resource.data.keys().hasOnly(['senderUid', 'senderName', 'text', 'createdAt'])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.senderName is string && request.resource.data.senderName.size() <= 120
+          && request.resource.data.text is string && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 4000 && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
       }
     }
   }

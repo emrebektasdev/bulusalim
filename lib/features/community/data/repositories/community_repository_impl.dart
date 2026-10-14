@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:bulusalim_app_01/core/firebase/firestore_dates.dart';
 
 import 'package:bulusalim_app_01/core/firebase/firebase_paths.dart';
 import '../../data/models/community.dart';
@@ -10,44 +11,53 @@ class CommunityRepositoryImpl implements CommunityRepository {
   final FirebaseFirestore _firestore;
 
   CommunityRepositoryImpl({FirebaseFirestore? firestore})
-      : _firestore = firestore ?? FirebaseFirestore.instance;
+    : _firestore = firestore ?? FirebaseFirestore.instance;
 
-  CollectionReference<Community> get _communitiesRef =>
-      _firestore.collection(FirestorePaths.communities).withConverter<Community>(
-            fromFirestore: (snapshot, _) => Community.fromJson(
-              {'id': snapshot.id, ...?snapshot.data()},
-            ),
-            toFirestore: (community, _) {
-              final json = community.toJson();
-              json.remove('id'); // ID is the document key
-              if (json['createdAt'] == null) {
-                json['createdAt'] = FieldValue.serverTimestamp();
-              }
-              return json;
-            },
-          );
+  CollectionReference<Community> get _communitiesRef => _firestore
+      .collection(FirestorePaths.communities)
+      .withConverter<Community>(
+        fromFirestore: (snapshot, _) => Community.fromJson({
+          'id': snapshot.id,
+          ...decodeFirestoreDates(snapshot.data() ?? {}),
+        }),
+        toFirestore: (community, _) {
+          final json = community.toJson();
+          json.remove('id'); // ID is the document key
+          if (json['createdAt'] == null) {
+            json['createdAt'] = FieldValue.serverTimestamp();
+          }
+          return encodeFirestoreDates(json);
+        },
+      );
 
   CollectionReference<CommunityMember> _membersRef(String communityId) =>
-      _firestore.collection('${FirestorePaths.communities}/$communityId/members').withConverter<CommunityMember>(
-            fromFirestore: (snapshot, _) => CommunityMember.fromJson(snapshot.data()!),
+      _firestore
+          .collection('${FirestorePaths.communities}/$communityId/members')
+          .withConverter<CommunityMember>(
+            fromFirestore: (snapshot, _) => CommunityMember.fromJson(
+              decodeFirestoreDates(snapshot.data()!),
+            ),
             toFirestore: (member, _) {
               final json = member.toJson();
               if (json['joinedAt'] == null) {
                 json['joinedAt'] = FieldValue.serverTimestamp();
               }
-              return json;
+              return encodeFirestoreDates(json);
             },
           );
 
   CollectionReference<JoinRequest> _requestsRef(String communityId) =>
-      _firestore.collection('${FirestorePaths.communities}/$communityId/joinRequests').withConverter<JoinRequest>(
-            fromFirestore: (snapshot, _) => JoinRequest.fromJson(snapshot.data()!),
+      _firestore
+          .collection('${FirestorePaths.communities}/$communityId/joinRequests')
+          .withConverter<JoinRequest>(
+            fromFirestore: (snapshot, _) =>
+                JoinRequest.fromJson(decodeFirestoreDates(snapshot.data()!)),
             toFirestore: (request, _) {
               final json = request.toJson();
               if (json['requestedAt'] == null) {
                 json['requestedAt'] = FieldValue.serverTimestamp();
               }
-              return json;
+              return encodeFirestoreDates(json);
             },
           );
 
@@ -92,16 +102,16 @@ class CommunityRepositoryImpl implements CommunityRepository {
     Object? startAfterDocumentSnapshot,
     String? category,
   }) async {
-    var query = _communitiesRef
-        .where('isDeleted', isEqualTo: false);
-    
+    var query = _communitiesRef.where('isDeleted', isEqualTo: false);
+
     if (category != null && category.isNotEmpty && category != 'Genel') {
       query = query.where('category', isEqualTo: category);
     }
 
     query = query.orderBy('createdAt', descending: true).limit(limit);
 
-    if (startAfterDocumentSnapshot != null && startAfterDocumentSnapshot is DocumentSnapshot) {
+    if (startAfterDocumentSnapshot != null &&
+        startAfterDocumentSnapshot is DocumentSnapshot) {
       query = query.startAfterDocument(startAfterDocumentSnapshot);
     }
 
@@ -120,9 +130,7 @@ class CommunityRepositoryImpl implements CommunityRepository {
 
   @override
   Future<void> updateCoverImage(String communityId, String url) async {
-    await _communitiesRef.doc(communityId).update({
-      'coverImageUrl': url,
-    });
+    await _communitiesRef.doc(communityId).update({'coverImageUrl': url});
   }
 
   @override
@@ -141,10 +149,21 @@ class CommunityRepositoryImpl implements CommunityRepository {
         throw Exception('Community not found');
       }
 
-      if (isPrivate) {
+      if (communityDoc.data()!.isPrivate) {
         // Private: Create a join request
         final requestDoc = await transaction.get(requestDocRef);
-        if (!requestDoc.exists) {
+        if (requestDoc.data()?.status == RequestStatus.approved) {
+          final memberDoc = await transaction.get(memberDocRef);
+          if (!memberDoc.exists) {
+            transaction.set(
+              memberDocRef,
+              CommunityMember(uid: uid, role: CommunityRole.member),
+            );
+            transaction.update(communityDocRef, {
+              'memberCount': FieldValue.increment(1),
+            });
+          }
+        } else if (!requestDoc.exists) {
           final newRequest = JoinRequest(
             uid: uid,
             status: RequestStatus.pending,
@@ -184,12 +203,14 @@ class CommunityRepositoryImpl implements CommunityRepository {
       if (memberDoc.exists) {
         final data = memberDoc.data();
         if (data?.role == CommunityRole.owner) {
-          throw Exception('Owner cannot leave the community. Transfer ownership or delete first.');
+          throw Exception(
+            'Owner cannot leave the community. Transfer ownership or delete first.',
+          );
         }
 
         transaction.delete(memberDocRef);
         transaction.update(communityDocRef, {
-           'memberCount': FieldValue.increment(-1),
+          'memberCount': FieldValue.increment(-1),
         });
       }
     });
