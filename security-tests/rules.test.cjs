@@ -33,6 +33,16 @@ function rsvp(uid,status='going',amount=1,id='e1') {
  const d=db(uid), b=writeBatch(d);b.set(doc(d,'events/'+id+'/attendees/'+uid),attendee(uid,status));
  if(amount)b.update(doc(d,'events/'+id),{attendeeCount:increment(amount)});return b.commit();
 }
+
+test('existing public profile fields remain editable only by their owner', async () => {
+ const profile={displayName:'Alice',fullName:'Alice Example',photoUrl:'',bio:'Hello',hobbies:[],preferredCityId:'34',preferredCityName:'Istanbul'};
+ await env.withSecurityRulesDisabled(c=>setDoc(doc(c.firestore(),'users/alice'),profile));
+ await assertSucceeds(updateDoc(doc(db('alice'),'users/alice'),{displayName:'Updated'}));
+ await assertSucceeds(updateDoc(doc(db('alice'),'users/alice'),{preferredCityId:'06',preferredCityName:'Ankara'}));
+ await assertFails(updateDoc(doc(db('bob'),'users/alice'),{displayName:'Forged'}));
+ await assertFails(updateDoc(doc(db('alice'),'users/alice'),{isAdmin:true}));
+ await assertFails(updateDoc(doc(db('alice'),'users/alice'),{apiSecret:'not-a-real-key'}));
+});
 test('owner creation is atomic and identities cannot be spoofed or reassigned', async () => {
  const d=db('owner'), b=writeBatch(d);b.set(doc(d,'communities/new'),community);b.set(doc(d,'communities/new/members/owner'),member('owner','owner'));
  await assertSucceeds(b.commit());
